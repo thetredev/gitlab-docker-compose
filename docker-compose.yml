@@ -1,0 +1,105 @@
+version: '3.7'
+
+services:
+  database:
+    image: postgres:15.3-alpine3.18
+    container_name: gitlab_database
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      POSTGRES_USER: gitlab
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: gitlabhq_production
+    volumes:
+      - /srv/gitlab/database:/var/lib/postgresql/data
+
+  application:
+    image: gitlab/gitlab-ee:16.2.4-ee.0
+    container_name: gitlab_application
+    restart: unless-stopped
+    hostname: ${GITLAB_URL}
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        letsencrypt['enable'] = false
+
+        external_url 'https://${GITLAB_URL}'
+        nginx['listen_https'] = true
+        nginx['redirect_http_to_https'] = false
+
+        registry['storage_delete_enabled'] = true
+        registry['registry_http_addr'] = '0.0.0.0:5000'
+
+        registry_external_url 'https://registry.${GITLAB_URL}'
+        registry_nginx['listen_https'] = false
+        registry_nginx['redirect_http_to_https'] = false
+
+        postgresql['enable'] = false
+        gitlab_rails['db_adapter'] = 'postgresql'
+        gitlab_rails['db_encoding'] = 'unicode'
+        gitlab_rails['db_host'] = 'gitlab_database'
+        gitlab_rails['db_password'] = '${POSTGRES_PASSWORD}'
+
+        # LDAP not needed for my usecase
+        gitlab_rails['ldap_enabled'] = false
+
+        # KAS not needed for my usecase
+        gitlab_kas['enable'] = false
+
+        # Performance optimizations -- delete for production environments
+        puma['worker_processes'] = 0
+        sidekiq['max_concurrency'] = 10
+
+        gitaly['configuration'] = {
+          ruby_max_rss: 200_000_000,
+          concurrency: [
+            {
+              rpc: '/gitaly.SmartHTTPService/PostReceivePack',
+              max_per_repo: 3
+            }, {
+              rpc: '/gitaly.SSHService/SSHUploadPack',
+              max_per_repo: 3
+            },
+          ],
+          env: {
+            GITALY_COMMAND_SPAWN_MAX_PARALLEL: 2,
+            LD_PRELOAD: '/opt/gitlab/embedded/lib/libjemalloc.so',
+            MALLOC_CONF: 'dirty_decay_ms:1000,muzzy_decay_ms:1000'
+          },
+        }
+
+        gitlab_rails['env'] = {
+          'MALLOC_CONF' => 'dirty_decay_ms:1000,muzzy_decay_ms:1000'
+        }
+
+        prometheus_monitoring['enable'] = false
+    ports:
+      - 22:22
+    volumes:
+      - /srv/gitlab/config:/etc/gitlab
+      - /srv/gitlab/data:/var/opt/gitlab
+    depends_on:
+      database:
+        condition: service_healthy
+    shm_size: '256m'
+
+  runner:
+    image: gitlab/gitlab-runner:alpine3.18-v16.2.1
+    container_name: gitlab_runner
+    restart: unless-stopped
+    volumes:
+      - /srv/gitlab/runner:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  proxy:
+    image: jc21/nginx-proxy-manager:2.10.4
+    container_name: gitlab_proxy
+    restart: unless-stopped
+    ports:
+      - 81:81
+      - 443:443
+    volumes:
+      - /srv/gitlab/proxy:/data
